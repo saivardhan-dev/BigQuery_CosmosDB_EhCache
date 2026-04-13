@@ -1,0 +1,215 @@
+server:
+  port: ${SERVER_PORT:8080}
+
+spring:
+  application:
+    name: bq-cdb-ch
+
+  batch:
+    job:
+      enabled: false          # CRITICAL: prevents auto-run on startup
+    jdbc:
+      initialize-schema: always
+
+  datasource:
+    # DB_CLOSE_ON_EXIT=FALSE prevents H2 from shutting down mid-run
+    # which would kill the Spring Batch job repository unexpectedly
+    url: jdbc:h2:mem:batchdb;DB_CLOSE_DELAY=-1;DB_CLOSE_ON_EXIT=FALSE
+    driver-class-name: org.h2.Driver
+    username: admin
+    password: admin
+
+  h2:
+    console:
+      enabled: false
+
+  jackson:
+    serialization:
+      write-dates-as-timestamps: false
+    deserialization:
+      fail-on-unknown-properties: false
+    # Suppress null fields in all JSON responses globally —
+    # consistent with @JsonInclude(NON_NULL) already on DTOs
+    default-property-inclusion: non_null
+
+  cloud:
+    azure:
+      cosmos:
+        endpoint: ${COSMOS_ENDPOINT:https://your-cosmos-account.documents.azure.com:443/}
+        key: ${COSMOS_KEY:your-cosmos-primary-key}
+        database: ${COSMOS_DATABASE:BigQuery-to-CosmosDB}
+        consistency-level: session
+        populate-query-metrics: false
+        connection-sharing-enabled: false
+        content-response-on-write-enabled: false
+
+# ─────────────────────────────────────────────
+# Azure Cosmos DB — custom bindings
+#
+# These keys are read directly by our own classes:
+#   CosmosDbConfig          → azure.cosmos.endpoint, .key, .database, .connection-mode, etc.
+#   CosmosContainerInitializer → azure.cosmos.database, .container, .partition-key
+#   CosmosHealthIndicator   → azure.cosmos.endpoint, .database
+#
+# IMPORTANT: use "endpoint" (not "uri") — must match @Value("${azure.cosmos.endpoint}")
+# in CosmosDbConfig.java and CosmosHealthIndicator.java
+# ─────────────────────────────────────────────
+azure:
+  cosmos:
+    endpoint: ${COSMOS_ENDPOINT:https://your-cosmos-account.documents.azure.com:443/}
+    key: ${COSMOS_KEY:your-cosmos-primary-key}
+    database: ${COSMOS_DATABASE:BigQuery-to-CosmosDB}
+    container: ${COSMOS_CONTAINER:records}
+    partition-key: /id
+    populate-query-metrics: false
+    consistency-level: SESSION
+    max-connection-pool-size: 100
+    connection-mode: DIRECT
+    preferred-regions:
+      - East US
+      - West US
+
+cosmos:
+  init-containers: ${COSMOS_INIT_CONTAINERS:true}
+
+# ─────────────────────────────────────────────
+# Google BigQuery
+# ─────────────────────────────────────────────
+bigquery:
+  project-id: ${BIGQUERY_PROJECT_ID:bigquery-to_cosmosdb}
+  dataset: ${BIGQUERY_DATASET:test_dataset}
+  table: ${BIGQUERY_TABLE:test_table}
+  credentials-path: ${GOOGLE_APPLICATION_CREDENTIALS:}
+  page-size: 1000
+  query-timeout-seconds: 120
+
+# ─────────────────────────────────────────────
+# EhCache (Native — programmatic only, no XML)
+# ─────────────────────────────────────────────
+ehcache:
+  records:
+    heap-entries: ${CACHE_HEAP_ENTRIES:200000}
+    offheap-mb: ${CACHE_OFFHEAP_MB:512}
+    ttl-minutes: ${CACHE_TTL_MINUTES:60}
+
+# ─────────────────────────────────────────────
+# Spring Batch / Pipeline tuning
+# ─────────────────────────────────────────────
+# ── Batch pipeline tuning for 1000 RU/s + bulk executor ──────────────────────
+#
+#  With bulkPushEnabled=true and contentResponseOnWriteEnabled=false in
+#  CosmosDbConfig, effective throughput is ~2.5x the provisioned RU/s.
+#
+#  1000 RU/s provisioned → ~250-300 effective docs/sec → 1M records in ~55-60 min
+#
+#  chunk-size: 500    — larger chunks work well with bulk executor (it batches internally)
+#  throttle-limit: 8  — 8 parallel threads to keep the bulk pipeline saturated
+#
+batch-pipeline:
+  chunk-size:     ${BATCH_CHUNK_SIZE:500}       # 500 with bulk executor at 1000 RU/s
+  throttle-limit: ${BATCH_THROTTLE_LIMIT:8}     # 8 parallel threads
+  skip-limit:     ${BATCH_SKIP_LIMIT:100}
+  retry-limit:    ${BATCH_RETRY_LIMIT:3}
+  max-retries:    ${BATCH_MAX_RETRIES:3}
+  retry-backoff-ms: 2000
+
+
+# ─────────────────────────────────────────────
+# Data Sync Scheduler
+# ─────────────────────────────────────────────
+scheduler:
+  sync:
+    enabled: ${SCHEDULER_ENABLED:true}
+    cron: ${SYNC_CRON:0 0 */12 * * *}  # Every 12 hours (at 00:00 and 12:00)
+    run-on-startup: ${SYNC_RUN_ON_STARTUP:true}  # Run sync immediately on app start
+
+# ─────────────────────────────────────────────
+# Resilience4j — Circuit Breaker + Retry
+#
+# Applied to BigQueryService.fetchAllRecords()
+# and BigQueryService.fetchRecordsSince()
+#
+# Circuit Breaker (instance: "bigquery"):
+#   CLOSED    → calls pass through normally.
+#   OPEN      → fast-fail for 30s after 50% failure rate over 10 calls.
+#   HALF-OPEN → 3 trial calls decide whether to re-CLOSE or stay OPEN.
+#
+# Retry (instance: "bigquery"):
+#   Up to 3 attempts with exponential backoff: 2s → 4s → 8s.
+#   Retry fires before the circuit breaker records a failure,
+#   so transient errors heal without tripping the breaker.
+# ─────────────────────────────────────────────
+resilience4j:
+  circuitbreaker:
+    instances:
+      bigquery:
+        failure-rate-threshold: 50
+        sliding-window-size: 10
+        wait-duration-in-open-state: 30s
+        permitted-number-of-calls-in-half-open-state: 3
+        automatic-transition-from-open-to-half-open-enabled: true
+        register-health-indicator: true
+  retry:
+    instances:
+      bigquery:
+        max-attempts: 3
+        wait-duration: 2s
+        enable-exponential-backoff: true
+        exponential-backoff-multiplier: 2
+
+# ─────────────────────────────────────────────
+# Actuator & Observability
+# ─────────────────────────────────────────────
+management:
+  endpoints:
+    web:
+      exposure:
+        # "batch" exposes Spring Batch job/step execution history
+        include: health,info,metrics,caches,prometheus,loggers,env,beans,circuitbreakers,batch
+      base-path: /actuator
+  endpoint:
+    health:
+      show-details: always
+      show-components: always
+    caches:
+      enabled: true
+    metrics:
+      enabled: true
+  health:
+    cosmos:
+      enabled: true
+    circuitbreakers:
+      enabled: true
+  metrics:
+    export:
+      prometheus:
+        enabled: true
+    tags:
+      application: ${spring.application.name}
+      environment: ${APP_ENV:local}
+
+# ─────────────────────────────────────────────
+# SpringDoc / Swagger UI
+# ─────────────────────────────────────────────
+springdoc:
+  api-docs:
+    path: /api-docs
+  swagger-ui:
+    path: /swagger-ui.html
+    operations-sorter: method
+    tags-sorter: alpha
+    display-request-duration: true
+
+# ─────────────────────────────────────────────
+# Logging
+# ─────────────────────────────────────────────
+logging:
+  level:
+    root: INFO
+    com.dataplatform.bq_cdb_ch: DEBUG
+    com.azure.cosmos: WARN
+    com.google.cloud: WARN
+    org.springframework.batch: INFO
+    io.github.resilience4j: INFO
+  pattern:
+    console: "%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] [%X{correlationId}] %-5level %logger{36} - %msg%n"
