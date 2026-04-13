@@ -87,11 +87,6 @@ Set these in IntelliJ → Run → Edit Configurations → Environment Variables 
 | `BIGQUERY_TABLE` | `cache_table` | BigQuery table name |
 | `CACHE_OFFHEAP_MB` | `512` | EhCache off-heap size (use 512 locally, 4096 in prod) |
 
-### VM Options (IntelliJ)
-
-```
--XX:MaxDirectMemorySize=1g
-```
 
 ### Key `application.yml` Settings
 
